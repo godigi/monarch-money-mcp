@@ -1,50 +1,25 @@
-"""
-Monarch Money MCP Server
-========================
-Dual-protocol server:
-  - /mcp   FastMCP streamable-HTTP (for Claude Desktop / Allen)
-  - /api/* Plain REST endpoints (for n8n HTTP Request nodes)
-  - /health Unauthenticated health check
-
-Auth: Authorization: Bearer {MCP_API_KEY} on /api/*. /mcp accepts that key or a
-GitHub OAuth token when GITHUB_CLIENT_ID is set. /health is always public.
-
-Env vars:
-  MONARCH_TOKEN      preferred; inject the Monarch bearer token directly (stateless)
-  MONARCH_EMAIL      fallback: email for login, and for re-login after a 401
-  MONARCH_PASSWORD   fallback: password for login, and for re-login after a 401
-  MONARCH_MFA_SECRET TOTP secret key for 2FA accounts (Base32 seed, NOT the 6-digit code)
-                     Found in: Monarch Settings -> Security -> MFA -> "Two-factor text code"
-                     Or in 1Password: Edit entry -> OTP field -> Copy Secret Key
-  MCP_API_KEY        required; guards /api/* always, and /mcp when OAuth is off
-  GITHUB_CLIENT_ID   optional; enables OAuth for Claude custom connectors
-  GITHUB_CLIENT_SECRET  required when GITHUB_CLIENT_ID is set
-  GITHUB_ALLOWED_USER   required when GITHUB_CLIENT_ID is set; the one GitHub login admitted
-  PUBLIC_BASE_URL       required when GITHUB_CLIENT_ID is set; must match the URL entered in Claude
-  PORT               optional, defaults to 8000
-"""
+"""Single-tenant Monarch MCP server with GitHub OAuth and mounted secrets."""
 
 from __future__ import annotations
 
-import asyncio
 import calendar
 import json
 import logging
 import os
-import time
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 import uvicorn
 from fastmcp import FastMCP
-from fastmcp.server.auth import AccessToken, MultiAuth, OAuthProxy, StaticTokenVerifier
+from fastmcp.server.auth import AccessToken, OAuthProxy
 from fastmcp.server.auth.providers.github import GitHubTokenVerifier
 from gql import gql
 from monarchmoney import MonarchMoney
 from monarchmoney.monarchmoney import MonarchMoneyEndpoints
 from starlette.applications import Starlette
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
@@ -54,20 +29,42 @@ logger = logging.getLogger("monarch_mcp")
 
 # --- Config ------------------------------------------------------------------
 
-MCP_API_KEY: str = os.environ["MCP_API_KEY"]  # required
-MONARCH_TOKEN: str | None = os.getenv("MONARCH_TOKEN")
-MONARCH_EMAIL: str | None = os.getenv("MONARCH_EMAIL")
-MONARCH_PASSWORD: str | None = os.getenv("MONARCH_PASSWORD")
-# Raw TOTP secret key (Base32 seed, NOT the 6-digit code).
-# Get it from: Monarch Settings -> Security -> MFA -> "Two-factor text code"
-# Or from 1Password: Edit the Monarch entry -> OTP field -> Copy Secret Key
-MONARCH_MFA_SECRET: str | None = os.getenv("MONARCH_MFA_SECRET")
-# OAuth (optional). When GITHUB_CLIENT_ID is unset, /mcp keeps its pre-OAuth
-# behavior and APIKeyMiddleware stays the only guard -- see _build_auth().
-GITHUB_CLIENT_ID: str | None = os.getenv("GITHUB_CLIENT_ID")
-GITHUB_CLIENT_SECRET: str | None = os.getenv("GITHUB_CLIENT_SECRET")
-GITHUB_ALLOWED_USER: str | None = os.getenv("GITHUB_ALLOWED_USER")
-PUBLIC_BASE_URL: str | None = os.getenv("PUBLIC_BASE_URL")
+def read_secret(name: str, file_env: str) -> str:
+    """Load a required secret from a host-mounted file without logging its value."""
+    path = os.getenv(file_env)
+    if not path:
+        raise RuntimeError(f"{name}: {file_env} must point to a secret file")
+    try:
+        value = Path(path).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(f"{name}: secret file is unavailable") from exc
+    if not value or "\n" in value or "\r" in value:
+        raise RuntimeError(f"{name}: secret file must contain one nonempty line")
+    return value
+
+def required_setting(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} is required")
+    return value
+
+
+def public_base_url() -> str:
+    value = required_setting("PUBLIC_BASE_URL")
+    parsed = urlsplit(value)
+    loopback = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    if (parsed.scheme != "https" and not (parsed.scheme == "http" and loopback)) or not parsed.netloc:
+        raise RuntimeError("PUBLIC_BASE_URL must use HTTPS outside localhost")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment or parsed.username:
+        raise RuntimeError("PUBLIC_BASE_URL must be an origin URL without /mcp")
+    return value.rstrip("/")
+
+
+MONARCH_TOKEN: str = read_secret("Monarch token", "MONARCH_TOKEN_FILE")
+GITHUB_CLIENT_ID: str = required_setting("GITHUB_CLIENT_ID")
+GITHUB_CLIENT_SECRET: str = read_secret("GitHub OAuth secret", "GITHUB_CLIENT_SECRET_FILE")
+GITHUB_ALLOWED_USER: str = required_setting("GITHUB_ALLOWED_USER")
+PUBLIC_BASE_URL: str = public_base_url()
 PORT: int = int(os.getenv("PORT", "8000"))
 
 # --- Monarch client (module-level singleton) ----------------------------------
@@ -78,13 +75,6 @@ MonarchMoneyEndpoints.BASE_URL = "https://api.monarch.com"
 
 mm = MonarchMoney()
 _monarch_ready: bool = False  # lazy-init flag
-_auth_epoch: int = 0  # bumped on every successful re-auth; dedupes concurrent retries
-_auth_lock = asyncio.Lock()
-# After a failed re-login, refuse further attempts until this monotonic deadline.
-# ponytail: one flat cooldown, not exponential backoff -- Monarch either accepts
-# the credentials or it does not, and a stuck deploy needs a human either way.
-AUTH_COOLDOWN_SECONDS: int = 60
-_auth_blocked_until: float = 0.0
 
 # Fix: Monarch removed the legacy `goals` query from their GraphQL schema.
 # monarchmoney v0.1.15 still emits `goals { id name completedAt targetDate }`
@@ -228,131 +218,21 @@ async def _patched_get_budgets(
 mm.get_budgets = _patched_get_budgets  # type: ignore[assignment]
 
 
-async def _login() -> None:
-    """Log in with email/password (+ auto-TOTP). Marks the client ready on success."""
-    global _monarch_ready
-    # monarchmoney POSTs the login with ClientSession(headers=self._headers), so a
-    # stale "Authorization: Token ..." left by the MONARCH_TOKEN branch travels on
-    # the login request and Monarch rejects it 401 without ever reading the
-    # credentials. Clear it first; _login_user re-sets it from the fresh token.
-    mm._headers.pop("Authorization", None)
-    try:
-        await mm.login(
-            email=MONARCH_EMAIL,
-            password=MONARCH_PASSWORD,
-            use_saved_session=False,
-            save_session=False,
-            mfa_secret_key=MONARCH_MFA_SECRET,  # None = no 2FA; Base32 secret = auto-TOTP
-        )
-        _monarch_ready = True
-        logger.info("Monarch: logged in with MONARCH_EMAIL / MONARCH_PASSWORD")
-        if MONARCH_MFA_SECRET:
-            logger.info(
-                "Monarch: 2FA TOTP generated automatically from MONARCH_MFA_SECRET"
-            )
-    except Exception as exc:
-        # RequireMFAException is raised when 2FA is enabled but mfa_secret_key was not given
-        if "RequireMFA" in type(exc).__name__ or "mfa" in str(exc).lower():
-            raise RuntimeError(
-                "Monarch requires 2FA but MONARCH_MFA_SECRET is not set. "
-                "Set it to the Base32 TOTP secret key (NOT the 6-digit code). "
-                "Find it in: Monarch Settings -> Security -> MFA -> 'Two-factor text code', "
-                "or in 1Password: Edit entry -> OTP field -> Copy Secret Key."
-            ) from exc
-        raise
-
-
 async def _init_monarch() -> None:
-    """Authenticate the Monarch Money client from env vars. Idempotent."""
+    """Install the browser session token without making a login request."""
     global _monarch_ready
     if _monarch_ready:
         return
-
-    if MONARCH_TOKEN:
-        mm.set_token(MONARCH_TOKEN)
-        mm._headers["Authorization"] = f"Token {MONARCH_TOKEN}"
-        _monarch_ready = True
-        logger.info("Monarch: using token from MONARCH_TOKEN env var (stateless)")
-        return
-
-    if not (MONARCH_EMAIL and MONARCH_PASSWORD):
-        raise RuntimeError(
-            "Set MONARCH_TOKEN, or set both MONARCH_EMAIL and MONARCH_PASSWORD"
-        )
-
-    await _login()
-
-
-def _is_auth_error(exc: BaseException) -> bool:
-    """True when Monarch rejected the session itself (HTTP 401), not the query."""
-    # gql's TransportServerError carries .code; aiohttp's ClientResponseError carries .status
-    return getattr(exc, "code", None) == 401 or getattr(exc, "status", None) == 401
-
-
-async def _reauth(seen_epoch: int) -> bool:
-    """
-    Re-login after a 401. Returns False when there is nothing to re-mint: a
-    token-only deploy has no credentials, so retrying would just replay the
-    same dead token.
-
-    Callers that saw the same epoch collapse into a single login. That matters
-    because when a session expires every in-flight request 401s at once, and a
-    TOTP code cannot be spent twice.
-
-    A login that fails starts a cooldown: without it every incoming request
-    attempts its own login, which is a credential-stuffing pattern aimed at
-    Monarch and a good way to get the account rate-limited or locked.
-    """
-    global _auth_epoch, _auth_blocked_until
-    if not (MONARCH_EMAIL and MONARCH_PASSWORD):
-        return False
-    async with _auth_lock:
-        if _auth_epoch != seen_epoch:
-            return True  # another task already re-authenticated
-
-        remaining = _auth_blocked_until - time.monotonic()
-        if remaining > 0:
-            logger.warning(
-                "Monarch re-auth in cooldown for another %.0fs after a failed "
-                "login - not retrying",
-                remaining,
-            )
-            return False
-
-        try:
-            await _login()
-        except Exception:
-            _auth_blocked_until = time.monotonic() + AUTH_COOLDOWN_SECONDS
-            logger.error(
-                "Monarch re-login failed - backing off for %ds",
-                AUTH_COOLDOWN_SECONDS,
-            )
-            raise
-        _auth_blocked_until = 0.0
-        _auth_epoch += 1
-    return True
+    mm.set_token(MONARCH_TOKEN)
+    mm._headers["Authorization"] = f"Token {MONARCH_TOKEN}"
+    _monarch_ready = True
+    logger.info("Monarch: using token from mounted file")
 
 
 async def _call(fn, *args: Any, **kwargs: Any) -> Any:
-    """
-    Run a Monarch client call, re-authenticating once if the session expired.
-
-    An expired MONARCH_TOKEN is promoted to a credential login here, so a stale
-    token self-heals at runtime instead of 401ing until the container restarts.
-    """
+    """Run one client call; an expired token must be replaced by the operator."""
     await _init_monarch()
-    seen_epoch = _auth_epoch
-    try:
-        return await fn(*args, **kwargs)
-    except Exception as exc:
-        if not _is_auth_error(exc):
-            raise
-        logger.warning("Monarch rejected the session (401) - re-authenticating")
-        if not await _reauth(seen_epoch):
-            raise
-        # ponytail: one retry, then give up. A second 401 is a real auth failure
-        # (wrong password, revoked MFA), not an expired session.
-        return await fn(*args, **kwargs)
+    return await fn(*args, **kwargs)
 
 
 def _json(data: Any) -> str:
@@ -371,10 +251,8 @@ class AllowlistedGitHubTokenVerifier(GitHubTokenVerifier):
     Returning None rather than raising is deliberate: FastMCP turns None into a
     401 with a WWW-Authenticate header, which is the handshake Claude needs to
     offer a Connect prompt. Raising here would not do that -- both
-    OAuthProxy.load_access_token and MultiAuth.verify_token catch every
-    exception a verifier raises and treat it as a failed match, so an
-    exception would still end up as this same None/401 path, just with the
-    real rejection reason buried in a debug log instead of the warning below.
+    OAuthProxy.load_access_token treats verifier exceptions as failed matches,
+    so returning None keeps the rejection reason in the warning below.
     """
 
     def __init__(self, allowed_login: str, **kwargs: Any) -> None:
@@ -400,28 +278,8 @@ class AllowlistedGitHubTokenVerifier(GitHubTokenVerifier):
         return result
 
 
-def _build_auth() -> MultiAuth | None:
-    """Compose OAuth for Claude's connector UI with the legacy key for n8n.
-
-    Returns None when GITHUB_CLIENT_ID is unset, which leaves /mcp exactly as it
-    behaved before OAuth existed. That is the documented rollback.
-    """
-    if not GITHUB_CLIENT_ID:
-        return None
-
-    missing = [
-        name
-        for name, value in (
-            ("GITHUB_CLIENT_SECRET", GITHUB_CLIENT_SECRET),
-            ("GITHUB_ALLOWED_USER", GITHUB_ALLOWED_USER),
-            ("PUBLIC_BASE_URL", PUBLIC_BASE_URL),
-        )
-        if not value
-    ]
-    if missing:
-        raise RuntimeError(
-            "GITHUB_CLIENT_ID is set, so these are required too: " + ", ".join(missing)
-        )
+def _build_auth() -> OAuthProxy:
+    """Require GitHub OAuth for every MCP request."""
 
     verifier = AllowlistedGitHubTokenVerifier(
         allowed_login=GITHUB_ALLOWED_USER,  # type: ignore[arg-type]
@@ -449,19 +307,10 @@ def _build_auth() -> MultiAuth | None:
         ],
     )
 
-    return MultiAuth(
-        server=proxy,
-        verifiers=[
-            # client_id is read with a bare subscript by StaticTokenVerifier;
-            # omitting it raises KeyError instead of failing auth cleanly.
-            StaticTokenVerifier(
-                {MCP_API_KEY: {"client_id": "legacy-api-key", "scopes": []}}
-            )
-        ],
-    )
+    return proxy
 
 
-_AUTH: MultiAuth | None = _build_auth()
+_AUTH: OAuthProxy = _build_auth()
 
 
 # --- FastMCP instance --------------------------------------------------------
@@ -834,110 +683,11 @@ def review_uncategorized(limit: str = "25") -> str:
     )
 
 
-# --- Auth Middleware ----------------------------------------------------------
-
-
-class APIKeyMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        path = request.url.path
-        # Health check is always public
-        if path == "/health":
-            return await call_next(request)
-        # With OAuth active, /mcp belongs to FastMCP's own RequireAuthMiddleware,
-        # which accepts this same key via MultiAuth -- so this middleware steps
-        # aside for it. The OAuth endpoints (/authorize, /token, /register,
-        # /consent, /auth/callback, /.well-known/*) are public by protocol, not
-        # guarded by FastMCP either; they fall through this same branch because
-        # they too are outside /api/. Without OAuth, auth=None means FastMCP
-        # guards nothing, so this middleware stays the only thing standing in
-        # front of /mcp.
-        if _AUTH is not None and not path.startswith("/api/"):
-            return await call_next(request)
-        auth = request.headers.get("Authorization", "")
-        if not (auth.startswith("Bearer ") and auth[7:] == MCP_API_KEY):
-            return JSONResponse({"error": "Unauthorized"}, status_code=401)
-        return await call_next(request)
-
-
-# --- REST Route Handlers -----------------------------------------------------
+# --- Public health check -----------------------------------------------------
 
 
 async def health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
-
-
-async def api_accounts(request: Request) -> JSONResponse:
-    try:
-        return JSONResponse(await _call(mm.get_accounts))
-    except Exception as exc:
-        logger.error("api_accounts: %s", exc)
-        return JSONResponse({"error": str(exc)}, status_code=500)
-
-
-async def api_transactions(request: Request) -> JSONResponse:
-    try:
-        params = dict(request.query_params)
-        limit = int(params.pop("limit", 100))
-        return JSONResponse(await _call(mm.get_transactions, limit=limit, **params))
-    except Exception as exc:
-        logger.error("api_transactions: %s", exc)
-        return JSONResponse({"error": str(exc)}, status_code=500)
-
-
-async def api_cashflow(request: Request) -> JSONResponse:
-    try:
-        params = dict(request.query_params)
-        return JSONResponse(await _call(mm.get_cashflow, **params))
-    except Exception as exc:
-        logger.error("api_cashflow: %s", exc)
-        return JSONResponse({"error": str(exc)}, status_code=500)
-
-
-async def api_budgets(request: Request) -> JSONResponse:
-    try:
-        params = dict(request.query_params)
-        return JSONResponse(await _call(mm.get_budgets, **params))
-    except Exception as exc:
-        logger.error("api_budgets: %s", exc)
-        return JSONResponse({"error": str(exc)}, status_code=500)
-
-
-async def api_recurring(request: Request) -> JSONResponse:
-    try:
-        params = dict(request.query_params)
-        return JSONResponse(await _call(mm.get_recurring_transactions, **params))
-    except Exception as exc:
-        logger.error("api_recurring: %s", exc)
-        return JSONResponse({"error": str(exc)}, status_code=500)
-
-
-async def api_networth(request: Request) -> JSONResponse:
-    try:
-        params = dict(request.query_params)
-        return JSONResponse(await _call(mm.get_aggregate_snapshots, **params))
-    except Exception as exc:
-        logger.error("api_networth: %s", exc)
-        return JSONResponse({"error": str(exc)}, status_code=500)
-
-
-async def api_update_transaction(request: Request) -> JSONResponse:
-    try:
-        txn_id = request.path_params["id"]
-        body = await request.json()
-        data = await _call(mm.update_transaction, transaction_id=txn_id, **body)
-        return JSONResponse(data)
-    except Exception as exc:
-        logger.error("api_update_transaction: %s", exc)
-        return JSONResponse({"error": str(exc)}, status_code=500)
-
-
-async def api_token(request: Request) -> JSONResponse:
-    """Return the current Monarch session token (useful for bootstrapping MONARCH_TOKEN)."""
-    await _init_monarch()
-    token = getattr(mm, "token", None)
-    if token:
-        return JSONResponse({"token": token})
-    return JSONResponse({"error": "No token available - login first"}, status_code=404)
 
 
 # --- App Assembly ------------------------------------------------------------
@@ -952,39 +702,18 @@ mcp_asgi = mcp.http_app()
 async def lifespan(app: Starlette):
     # Delegate to FastMCP's own lifespan first (required for /mcp to work).
     async with mcp_asgi.lifespan(app):
-        # Also try to init Monarch at startup; each handler retries lazily.
-        try:
-            await _init_monarch()
-        except Exception as exc:
-            logger.warning(
-                "Monarch init failed at startup (will retry on first request): %s", exc
-            )
+        await _init_monarch()
         yield
 
 
 app = Starlette(
     routes=[
         Route("/health", endpoint=health, methods=["GET"]),
-        # REST endpoints for n8n
-        Route("/api/accounts", endpoint=api_accounts, methods=["GET"]),
-        Route("/api/transactions", endpoint=api_transactions, methods=["GET"]),
-        Route("/api/cashflow", endpoint=api_cashflow, methods=["GET"]),
-        Route("/api/budgets", endpoint=api_budgets, methods=["GET"]),
-        Route("/api/recurring", endpoint=api_recurring, methods=["GET"]),
-        Route("/api/networth", endpoint=api_networth, methods=["GET"]),
-        Route(
-            "/api/transaction/{id:str}",
-            endpoint=api_update_transaction,
-            methods=["POST"],
-        ),
-        Route("/api/token", endpoint=api_token, methods=["GET"]),
-        # FastMCP MCP protocol - handles /mcp (catch-all after explicit routes)
+        # FastMCP handles /mcp and the OAuth protocol routes.
         Mount("/", app=mcp_asgi),
     ],
     lifespan=lifespan,
 )
-
-app.add_middleware(APIKeyMiddleware)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
