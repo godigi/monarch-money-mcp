@@ -16,11 +16,11 @@ import tempfile
 from pathlib import Path
 
 _test_dir = tempfile.TemporaryDirectory()
-_token = Path(_test_dir.name) / "monarch.token"
+_cookie = Path(_test_dir.name) / "monarch.cookie"
 _github = Path(_test_dir.name) / "github.secret"
-_token.write_text("test-token\n")
+_cookie.write_text("session_id=test-session; csrftoken=test-csrf\n")
 _github.write_text("test-secret\n")
-os.environ["MONARCH_TOKEN_FILE"] = str(_token)
+os.environ["MONARCH_COOKIE_FILE"] = str(_cookie)
 os.environ["GITHUB_CLIENT_SECRET_FILE"] = str(_github)
 os.environ["GITHUB_CLIENT_ID"] = "Ov23liTEST"
 os.environ["GITHUB_ALLOWED_USER"] = "godigi"

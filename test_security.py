@@ -12,11 +12,11 @@ from gql.transport.exceptions import TransportServerError
 from starlette.testclient import TestClient
 
 _test_secrets = tempfile.TemporaryDirectory()
-_token_path = Path(_test_secrets.name) / "monarch.token"
+_cookie_path = Path(_test_secrets.name) / "monarch.cookie"
 _github_path = Path(_test_secrets.name) / "github.secret"
-_token_path.write_text("test-token\n")
+_cookie_path.write_text("session_id=test-session; csrftoken=test-csrf\n")
 _github_path.write_text("test-secret\n")
-os.environ["MONARCH_TOKEN_FILE"] = str(_token_path)
+os.environ["MONARCH_COOKIE_FILE"] = str(_cookie_path)
 os.environ["GITHUB_CLIENT_SECRET_FILE"] = str(_github_path)
 os.environ["GITHUB_CLIENT_ID"] = "Ov23liTEST"
 os.environ["GITHUB_CLIENT_SECRET"] = "legacy-test-secret"
@@ -28,29 +28,57 @@ os.environ.setdefault("MCP_API_KEY", "test-key")
 import server  # noqa: E402
 
 
+class CookieAuthTests(unittest.TestCase):
+    def test_cookie_auth_requires_session_and_csrf(self):
+        for value in ("session_id=only-session", "csrftoken=only-csrf", "curl --url https://api.monarch.com/graphql"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(RuntimeError, "Monarch cookie"):
+                    server.monarch_cookie_headers(value)
+
+    def test_cookie_auth_sets_transport_headers_without_legacy_token(self):
+        headers = server.monarch_cookie_headers(
+            "session_id=test-session; csrftoken=test-csrf; theme=dark"
+        )
+        self.assertEqual(headers["Cookie"], "session_id=test-session; csrftoken=test-csrf; theme=dark")
+        self.assertEqual(headers["X-CSRFToken"], "test-csrf")
+        self.assertEqual(headers["Origin"], "https://app.monarch.com")
+        self.assertNotIn("Authorization", headers)
+
+    def test_graphql_transport_logging_cannot_emit_financial_responses(self):
+        import logging
+        self.assertGreaterEqual(logging.getLogger("gql.transport.aiohttp").getEffectiveLevel(), logging.WARNING)
+
+    def test_monarch_transport_verifies_tls_and_sends_cookie(self):
+        asyncio.run(server._init_monarch())
+        transport = server.mm._get_graphql_client().transport
+        self.assertIs(transport.ssl, True)
+        self.assertEqual(transport.headers["Cookie"], server.MONARCH_COOKIE)
+        self.assertEqual(transport.headers["X-CSRFToken"], "test-csrf")
+
+
 class SecretFileTests(unittest.TestCase):
-    def test_reads_token_from_file_without_exposing_it_in_environment(self):
+    def test_reads_cookie_from_file_without_exposing_it_in_environment(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "monarch.token"
-            path.write_text("browser-token\n")
-            with patch.dict(os.environ, {"MONARCH_TOKEN_FILE": str(path)}):
+            path = Path(directory) / "monarch.cookie"
+            path.write_text("session_id=test-session; csrftoken=test-csrf\n")
+            with patch.dict(os.environ, {"MONARCH_COOKIE_FILE": str(path)}):
                 self.assertEqual(
-                    server.read_secret("Monarch token", "MONARCH_TOKEN_FILE"),
-                    "browser-token",
+                    server.read_secret("Monarch cookie", "MONARCH_COOKIE_FILE"),
+                    "session_id=test-session; csrftoken=test-csrf",
                 )
 
     def test_missing_file_fails_closed(self):
-        with patch.dict(os.environ, {"MONARCH_TOKEN_FILE": "/missing/monarch.token"}):
-            with self.assertRaisesRegex(RuntimeError, "Monarch token"):
-                server.read_secret("Monarch token", "MONARCH_TOKEN_FILE")
+        with patch.dict(os.environ, {"MONARCH_COOKIE_FILE": "/missing/monarch.cookie"}):
+            with self.assertRaisesRegex(RuntimeError, "Monarch cookie"):
+                server.read_secret("Monarch cookie", "MONARCH_COOKIE_FILE")
 
     def test_blank_file_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "monarch.token"
+            path = Path(directory) / "monarch.cookie"
             path.write_text("\n")
-            with patch.dict(os.environ, {"MONARCH_TOKEN_FILE": str(path)}):
-                with self.assertRaisesRegex(RuntimeError, "Monarch token"):
-                    server.read_secret("Monarch token", "MONARCH_TOKEN_FILE")
+            with patch.dict(os.environ, {"MONARCH_COOKIE_FILE": str(path)}):
+                with self.assertRaisesRegex(RuntimeError, "Monarch cookie"):
+                    server.read_secret("Monarch cookie", "MONARCH_COOKIE_FILE")
 
 
 class StartupTests(unittest.TestCase):
@@ -59,6 +87,7 @@ class StartupTests(unittest.TestCase):
         for key in (
             "MONARCH_TOKEN",
             "MONARCH_TOKEN_FILE",
+            "MONARCH_COOKIE_FILE",
             "MONARCH_EMAIL",
             "MONARCH_PASSWORD",
             "MONARCH_MFA_SECRET",
@@ -79,17 +108,28 @@ class StartupTests(unittest.TestCase):
             check=False,
         )
 
-    def test_missing_monarch_file_refuses_startup_even_with_legacy_env_token(self):
+    def test_missing_monarch_cookie_refuses_startup_even_with_legacy_env_token(self):
         result = self._import_server({"MONARCH_TOKEN": "legacy-token", "MCP_API_KEY": "test-key"})
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("MONARCH_TOKEN_FILE", result.stderr)
+        self.assertIn("MONARCH_COOKIE_FILE", result.stderr)
+
+    def test_cookie_file_boots_without_legacy_token(self):
+        result = self._import_server({
+            "MONARCH_COOKIE_FILE": str(_cookie_path),
+            "GITHUB_CLIENT_SECRET_FILE": str(_github_path),
+            "GITHUB_CLIENT_ID": "Ov23liTEST",
+            "GITHUB_ALLOWED_USER": "godigi",
+            "PUBLIC_BASE_URL": "https://monarch-mcp.briansagency.com",
+            "FASTMCP_HOME": _test_secrets.name,
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_missing_github_secret_file_refuses_startup(self):
         with tempfile.TemporaryDirectory() as directory:
-            token = Path(directory) / "monarch.token"
-            token.write_text("browser-token\n")
+            cookie = Path(directory) / "monarch.cookie"
+            cookie.write_text("session_id=test-session; csrftoken=test-csrf\n")
             result = self._import_server({
-                "MONARCH_TOKEN_FILE": str(token),
+                "MONARCH_COOKIE_FILE": str(cookie),
                 "MCP_API_KEY": "test-key",
                 "GITHUB_CLIENT_ID": "Ov23liTEST",
                 "GITHUB_CLIENT_SECRET": "legacy-secret",
@@ -101,12 +141,12 @@ class StartupTests(unittest.TestCase):
 
     def test_valid_host_files_boot_without_password_or_static_key(self):
         with tempfile.TemporaryDirectory() as directory:
-            token = Path(directory) / "monarch.token"
+            cookie = Path(directory) / "monarch.cookie"
             github = Path(directory) / "github.secret"
-            token.write_text("browser-token\n")
+            cookie.write_text("session_id=test-session; csrftoken=test-csrf\n")
             github.write_text("oauth-secret\n")
             result = self._import_server({
-                "MONARCH_TOKEN_FILE": str(token),
+                "MONARCH_COOKIE_FILE": str(cookie),
                 "GITHUB_CLIENT_SECRET_FILE": str(github),
                 "GITHUB_CLIENT_ID": "Ov23liTEST",
                 "GITHUB_ALLOWED_USER": "godigi",
@@ -117,12 +157,12 @@ class StartupTests(unittest.TestCase):
 
     def test_blank_github_client_id_refuses_startup(self):
         with tempfile.TemporaryDirectory() as directory:
-            token = Path(directory) / "monarch.token"
+            cookie = Path(directory) / "monarch.cookie"
             github = Path(directory) / "github.secret"
-            token.write_text("browser-token\n")
+            cookie.write_text("session_id=test-session; csrftoken=test-csrf\n")
             github.write_text("oauth-secret\n")
             result = self._import_server({
-                "MONARCH_TOKEN_FILE": str(token),
+                "MONARCH_COOKIE_FILE": str(cookie),
                 "GITHUB_CLIENT_SECRET_FILE": str(github),
                 "GITHUB_CLIENT_ID": "",
                 "GITHUB_ALLOWED_USER": "godigi",
@@ -134,12 +174,12 @@ class StartupTests(unittest.TestCase):
 
     def test_public_base_url_requires_https_and_excludes_mcp_path(self):
         with tempfile.TemporaryDirectory() as directory:
-            token = Path(directory) / "monarch.token"
+            cookie = Path(directory) / "monarch.cookie"
             github = Path(directory) / "github.secret"
-            token.write_text("browser-token\n")
+            cookie.write_text("session_id=test-session; csrftoken=test-csrf\n")
             github.write_text("oauth-secret\n")
             base = {
-                "MONARCH_TOKEN_FILE": str(token),
+                "MONARCH_COOKIE_FILE": str(cookie),
                 "GITHUB_CLIENT_SECRET_FILE": str(github),
                 "GITHUB_CLIENT_ID": "Ov23liTEST",
                 "GITHUB_ALLOWED_USER": "godigi",
@@ -203,7 +243,7 @@ class RouteTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 401)
 
-    def test_expired_monarch_token_is_not_retried_with_a_password(self):
+    def test_expired_monarch_session_is_not_retried_with_a_password(self):
         calls = []
 
         async def expired():
@@ -213,6 +253,8 @@ class RouteTests(unittest.TestCase):
         with self.assertRaises(TransportServerError):
             asyncio.run(server._call(expired))
         self.assertEqual(len(calls), 1)
+        self.assertIn("Cookie", server.mm._headers)
+        self.assertNotIn("Authorization", server.mm._headers)
 
     def test_transaction_and_budget_writes_remain_available_to_authorized_clients(self):
         tools = asyncio.run(server.mcp.list_tools())

@@ -16,7 +16,8 @@ import uvicorn
 from fastmcp import FastMCP
 from fastmcp.server.auth import AccessToken, OAuthProxy
 from fastmcp.server.auth.providers.github import GitHubTokenVerifier
-from gql import gql
+from gql import Client, gql
+from gql.transport.aiohttp import AIOHTTPTransport
 from monarchmoney import MonarchMoney
 from monarchmoney.monarchmoney import MonarchMoneyEndpoints
 from starlette.applications import Starlette
@@ -24,8 +25,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("monarch_mcp")
+logger.setLevel(logging.INFO)
+# gql logs full GraphQL responses at INFO, which can contain financial data.
+logging.getLogger("gql.transport.aiohttp").setLevel(logging.WARNING)
 
 # --- Config ------------------------------------------------------------------
 
@@ -41,6 +45,23 @@ def read_secret(name: str, file_env: str) -> str:
     if not value or "\n" in value or "\r" in value:
         raise RuntimeError(f"{name}: secret file must contain one nonempty line")
     return value
+
+
+def monarch_cookie_headers(cookie: str) -> dict[str, str]:
+    """Build the browser-session headers without logging credential values."""
+    parts = {}
+    for item in cookie.split(";"):
+        name, separator, value = item.strip().partition("=")
+        if separator:
+            parts[name] = value
+    if "\n" in cookie or "\r" in cookie or not parts.get("session_id") or not parts.get("csrftoken"):
+        raise RuntimeError("Monarch cookie must contain session_id and csrftoken")
+    return {
+        "Cookie": cookie,
+        "X-CSRFToken": parts["csrftoken"],
+        "Origin": "https://app.monarch.com",
+        "Referer": "https://app.monarch.com/",
+    }
 
 def required_setting(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -60,7 +81,8 @@ def public_base_url() -> str:
     return value.rstrip("/")
 
 
-MONARCH_TOKEN: str = read_secret("Monarch token", "MONARCH_TOKEN_FILE")
+MONARCH_COOKIE: str = read_secret("Monarch cookie", "MONARCH_COOKIE_FILE")
+MONARCH_HEADERS: dict[str, str] = monarch_cookie_headers(MONARCH_COOKIE)
 GITHUB_CLIENT_ID: str = required_setting("GITHUB_CLIENT_ID")
 GITHUB_CLIENT_SECRET: str = read_secret("GitHub OAuth secret", "GITHUB_CLIENT_SECRET_FILE")
 GITHUB_ALLOWED_USER: str = required_setting("GITHUB_ALLOWED_USER")
@@ -75,6 +97,24 @@ MonarchMoneyEndpoints.BASE_URL = "https://api.monarch.com"
 
 mm = MonarchMoney()
 _monarch_ready: bool = False  # lazy-init flag
+
+
+def _secure_graphql_client() -> Client:
+    """Use the library's query methods with certificate verification enabled."""
+    transport = AIOHTTPTransport(
+        url=MonarchMoneyEndpoints.getGraphQL(),
+        headers=mm._headers,
+        timeout=mm.timeout,
+        ssl=True,
+    )
+    return Client(
+        transport=transport,
+        fetch_schema_from_transport=False,
+        execute_timeout=mm.timeout,
+    )
+
+
+mm._get_graphql_client = _secure_graphql_client  # type: ignore[method-assign]
 
 # Fix: Monarch removed the legacy `goals` query from their GraphQL schema.
 # monarchmoney v0.1.15 still emits `goals { id name completedAt targetDate }`
@@ -219,18 +259,18 @@ mm.get_budgets = _patched_get_budgets  # type: ignore[assignment]
 
 
 async def _init_monarch() -> None:
-    """Install the browser session token without making a login request."""
+    """Install the browser session without making a login request."""
     global _monarch_ready
     if _monarch_ready:
         return
-    mm.set_token(MONARCH_TOKEN)
-    mm._headers["Authorization"] = f"Token {MONARCH_TOKEN}"
+    mm._headers.pop("Authorization", None)
+    mm._headers.update(MONARCH_HEADERS)
     _monarch_ready = True
-    logger.info("Monarch: using token from mounted file")
+    logger.info("Monarch: using browser session from mounted file")
 
 
 async def _call(fn, *args: Any, **kwargs: Any) -> Any:
-    """Run one client call; an expired token must be replaced by the operator."""
+    """Run one client call; an expired session must be replaced by the operator."""
     await _init_monarch()
     return await fn(*args, **kwargs)
 
