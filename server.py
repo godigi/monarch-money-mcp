@@ -297,6 +297,12 @@ def _build_auth() -> OAuthProxy:
         base_url=PUBLIC_BASE_URL,
         redirect_path="/auth/callback",
         allowed_client_redirect_uris=[
+            # ChatGPT's app form provided this per-connection callback before
+            # the server was live. Keep it exact: an OAuth code must not be
+            # redirected to an arbitrary origin. The stable callback applies
+            # when ChatGPT recognizes FastMCP's issuer metadata.
+            "https://chatgpt.com/connector/oauth/R3V1cbYg3KfX",
+            "https://chatgpt.com/connector_platform_oauth_redirect",
             # claude.ai and claude.com are both Anthropic-owned; Claude's
             # connector callback has been observed on either host.
             "https://claude.ai/api/mcp/auth_callback",

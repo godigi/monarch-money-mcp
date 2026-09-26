@@ -1,6 +1,6 @@
 # Monarch Money MCP for vps2
 
-This fork is a single-tenant Monarch Money MCP server for the operator's Claude connector. It uses the [upstream FastMCP server](https://github.com/richardadonnell/monarch-money-mcp) at commit `77789519c09ac539be7e2540bf4fe3369884de23`, with a smaller security surface:
+This fork is a single-tenant Monarch Money MCP server for the operator's Claude and ChatGPT connectors. It uses the [upstream FastMCP server](https://github.com/richardadonnell/monarch-money-mcp) at commit `77789519c09ac539be7e2540bf4fe3369884de23`, with a smaller security surface:
 
 - `/mcp` requires GitHub OAuth and admits only `GITHUB_ALLOWED_USER`.
 - `/health` is public and returns only `{"status":"ok"}`.
@@ -24,14 +24,14 @@ Configure runtime variables (not build variables):
 | `PUBLIC_BASE_URL` | `https://monarch-mcp.briansagency.com` |
 | `FASTMCP_HOME` | `/data` |
 
-Create a GitHub OAuth App under the allowed account. Its callback URL must be exactly `https://monarch-mcp.briansagency.com/auth/callback`. Mount the existing host files into the application:
+Create a **GitHub OAuth App** under the allowed account in GitHub's Developer settings. Its callback URL must be exactly `https://monarch-mcp.briansagency.com/auth/callback`. This is distinct from ChatGPT's custom app setup: ChatGPT's `https://chatgpt.com/connector/oauth/...` URL is a return address for the MCP client and is allowlisted in this server. The GitHub OAuth App client ID and secret belong on the VPS, not in ChatGPT's manual OAuth client fields. Mount the existing host files into the application:
 
 | Host file | Container path |
 | --- | --- |
 | `/root/credentials/apps/monarch.token` | `/run/secrets/monarch.token` |
 | `/root/credentials/apps/monarch-github-oauth.secret` | `/run/secrets/github-oauth.secret` |
 
-The container runs as UID/GID 10001. On the VPS, make each source file root-owned, group 10001, mode 0440, and keep the parent directory root-only. Use Coolify **Host File Mount**, not a managed File Mount, so Coolify does not copy the contents into its resource configuration. Mount a persistent named volume at `/data` for FastMCP client registration and OAuth state. Back up that volume or reauthorize Claude after loss.
+The container runs as UID/GID 10001. On the VPS, make each source file root-owned, group 10001, mode 0440, and keep the parent directory root-only. Use Coolify **Host File Mount**, not a managed File Mount, so Coolify does not copy the contents into its resource configuration. Mount a persistent named volume at `/data` for FastMCP client registration and OAuth state. Back up that volume or reauthorize connected clients after loss.
 
 Never paste the Monarch token into chat or a terminal command that will be recorded in shell history. Transfer it from the Mac directly to the on-box path. A token-only deployment cannot renew an expired Monarch token; replace the file and restart the app when calls start returning 401.
 
@@ -39,7 +39,9 @@ Never paste the Monarch token into chat or a terminal command that will be recor
 
 Run `./verify_server.sh https://monarch-mcp.briansagency.com` from outside the VPS. It requires unauthenticated MCP requests to get 401 with an OAuth challenge, removed REST routes to return 404, and OAuth metadata to identify this MCP resource. It does not print financial data or secrets.
 
-Then add `https://monarch-mcp.briansagency.com/mcp` as a Claude custom connector and authenticate through GitHub. Read accounts to prove the Monarch token works. A live write test requires a specific transaction or budget change approved by the operator, followed by a read-back. A successful deployment status alone is not proof that authentication or Monarch access works.
+Then add `https://monarch-mcp.briansagency.com/mcp` as a Claude custom connector or ChatGPT custom MCP app and authenticate through GitHub. FastMCP publishes a dynamic client registration endpoint, so let the client register through OAuth discovery; do not copy the upstream GitHub OAuth App credentials into ChatGPT. The ChatGPT callback shown during initial setup, `https://chatgpt.com/connector/oauth/R3V1cbYg3KfX`, and its stable callback are both allowlisted exactly. Read accounts to prove the Monarch token works. A live write test requires a specific transaction or budget change approved by the operator, followed by a read-back. A successful deployment status alone is not proof that authentication or Monarch access works.
+
+[OpenAI's current custom MCP app guidance](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt) says ChatGPT custom apps are web-only, and full MCP write support is available for Business and Enterprise/Edu workspaces; Pro can connect with read/fetch permissions. Verify the workspace's action controls before expecting the two write tools in ChatGPT.
 
 ## Local tests
 

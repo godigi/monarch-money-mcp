@@ -155,6 +155,28 @@ class StartupTests(unittest.TestCase):
 
 
 class RouteTests(unittest.TestCase):
+    def test_chatgpt_callback_can_register_but_an_unrelated_redirect_cannot(self):
+        def payload(redirect_uri):
+            return {
+                "client_name": "ChatGPT Monarch MCP",
+                "redirect_uris": [redirect_uri],
+                "grant_types": ["authorization_code"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+            }
+
+        with TestClient(server.app) as client:
+            allowed = client.post(
+                "/register",
+                json=payload("https://chatgpt.com/connector/oauth/R3V1cbYg3KfX"),
+            )
+            denied = client.post(
+                "/register",
+                json=payload("https://example.com/steal-code"),
+            )
+        self.assertEqual(allowed.status_code, 201)
+        self.assertEqual(denied.status_code, 400)
+
     def test_token_return_route_is_absent_even_with_legacy_key(self):
         with TestClient(server.app) as client:
             response = client.get("/api/token", headers={"Authorization": "Bearer test-key"})
