@@ -211,7 +211,7 @@ class RuleManagement:
         """Preview before/after policy for an existing native rule; no transactions are changed.
 
         Omitted changes preserve fields; null clears only that field, [] clears ID lists.
-        Changing merchant_name also replaces legacy merchant criteria. All advanced actions
+        Text edits replace legacy matching only in the same condition domain. Advanced actions
         are preserved. This is a policy preview, not a historical match simulation.
         Show it to the user before updating. The one-use ID expires in 15 minutes.
         """
