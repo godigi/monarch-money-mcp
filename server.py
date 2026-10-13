@@ -372,7 +372,9 @@ mcp = FastMCP(
         "investment holdings. Use ISO 8601 dates (YYYY-MM-DD) for all date parameters. "
         "Default date range when unspecified: current calendar month. "
         "List category/tag IDs and identify the exact transaction before writes. "
-        "Show rule previews to the user before creating a native rule; applying to "
+        "Show rule previews before creating or updating native rules. Rule edits preserve "
+        "unedited fields; delete tags only when account-wide removal is intended. "
+        "Rule order changes future outcomes. Native rule disable is unavailable. Applying to "
         "existing history is off by default. Receipts attach to an existing transaction "
         "without OCR or changing amounts. Use the local Monarch receipts helper for "
         "Claude Code file paths; the remote server cannot read Mac paths."
@@ -380,7 +382,10 @@ mcp = FastMCP(
     auth=_AUTH,
 )
 
+from rule_management import register_management_tools
+
 transaction_tools = register_transaction_tools(mcp, mm, _call)
+rule_management = register_management_tools(mcp, transaction_tools)
 receipt_tools = register_attachment_tools(mcp, transaction_tools)
 
 # --- MCP Tools ---------------------------------------------------------------

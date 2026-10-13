@@ -142,15 +142,27 @@ class RuleSpec(BaseModel):
 
 RULES_QUERY = gql("""
 query GetTransactionRules {
-  transactionRules {
-    id order merchantCriteriaUseOriginalStatement
-    merchantNameCriteria { operator value }
-    originalStatementCriteria { operator value }
-    amountCriteria { operator isExpense value valueRange { lower upper } }
-    accountIds categoryIds
-    setCategoryAction { id name } setMerchantAction { id name }
-    addTagsAction { id name } setHideFromReportsAction reviewStatusAction
+ transactionRules {
+  id order merchantCriteriaUseOriginalStatement
+  merchantCriteria {operator value}
+  merchantNameCriteria {operator value}
+  originalStatementCriteria {operator value}
+  amountCriteria {operator isExpense value valueRange {lower upper}}
+  accountIds categoryIds criteriaOwnerIsJoint criteriaOwnerUserIds
+  criteriaBusinessEntityIds criteriaBusinessEntityIsUnassigned
+  setCategoryAction {id name} setMerchantAction {id name} addTagsAction {id name}
+  linkGoalAction {id name} linkSavingsGoalAction {id name}
+  needsReviewByUserAction {id displayName} unassignNeedsReviewByUserAction
+  setHideFromReportsAction reviewStatusAction sendNotificationAction setLinkToPaydownBudgetAction
+  actionSetOwnerIsJoint actionSetOwner {id displayName}
+  actionSetBusinessEntity {id name} actionSetBusinessEntityIsUnassigned
+  splitTransactionsAction {
+   amountType splitsInfo {
+    categoryId merchantName amount goalId savingsGoalId tags hideFromReports
+    reviewStatus needsReviewByUserId ownerUserId ownerIsJoint businessEntityId businessEntityIsUnassigned
+   }
   }
+ }
 }
 """)
 CREATE_RULE = gql("""
@@ -169,6 +181,7 @@ class TransactionTools:
         self._locks = {}
         self._previews = {}
         self._tag_creation_lock = asyncio.Lock()
+        self._rule_write_lock = asyncio.Lock()
 
     @asynccontextmanager
     async def transaction_lock(self, transaction_id):
@@ -241,6 +254,10 @@ class TransactionTools:
 
     async def add_transaction_tags(self, transaction_id: str, tag_ids: list[str]) -> dict:
         """Add tag IDs while preserving existing tags. Read/verify the exact transaction."""
+        async with self._tag_creation_lock:
+            return await self._add_transaction_tags(transaction_id, tag_ids)
+
+    async def _add_transaction_tags(self, transaction_id, tag_ids):
         transaction_id = require_id(transaction_id)
         wanted = await self.validate_tag_ids(tag_ids)
         if not wanted:
@@ -327,6 +344,10 @@ class TransactionTools:
         apply_to_existing=True affects ALL matching history, beyond the preview's dates.
         IDs are consumed before the mutation; inspect rules before retrying an uncertain write.
         """
+        async with self._rule_write_lock:
+            return await self._create_transaction_rule(preview_id, apply_to_existing)
+
+    async def _create_transaction_rule(self, preview_id, apply_to_existing):
         preview = self._previews.pop(preview_id, None)
         if preview is None or preview[0] <= self.clock():
             raise ValueError("Preview is missing, consumed or expired; preview again before creating")
