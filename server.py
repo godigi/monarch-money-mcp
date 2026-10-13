@@ -5,15 +5,16 @@ from __future__ import annotations
 import calendar
 import json
 import logging
+import math
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
 import uvicorn
-from fastmcp import FastMCP
+from fastmcp import FastMCP, settings as fastmcp_settings
 from fastmcp.server.auth import AccessToken, OAuthProxy
 from fastmcp.server.auth.providers.github import GitHubTokenVerifier
 from gql import Client, gql
@@ -26,9 +27,11 @@ from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
 from attachments import register_attachment_tools
-from transaction_tools import register_transaction_tools
+from transaction_tools import register_transaction_tools, require_id
+from security import OAuthAdmissionGuard, install_private_logging
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+install_private_logging()
 logger = logging.getLogger("monarch_mcp")
 logger.setLevel(logging.INFO)
 # gql logs full GraphQL responses at INFO, which can contain financial data.
@@ -275,7 +278,10 @@ async def _init_monarch() -> None:
 async def _call(fn, *args: Any, **kwargs: Any) -> Any:
     """Run one client call; an expired session must be replaced by the operator."""
     await _init_monarch()
-    return await fn(*args, **kwargs)
+    try:
+        return await fn(*args, **kwargs)
+    except Exception:
+        raise ValueError("Monarch request failed; retry reads only. A write may have completed; inspect before repeating.") from None
 
 
 def _json(data: Any) -> str:
@@ -339,6 +345,9 @@ def _build_auth() -> OAuthProxy:
         token_verifier=verifier,
         base_url=PUBLIC_BASE_URL,
         redirect_path="/auth/callback",
+        # Installed clients use DCR. URL metadata discovery can persist anonymous
+        # clients through /token before grant validation, bypassing DCR admission.
+        enable_cimd=False,
         allowed_client_redirect_uris=[
             # ChatGPT's app form provided this per-connection callback before
             # the server was live. Keep it exact: an OAuth code must not be
@@ -434,6 +443,8 @@ async def get_transactions(
         is_split: Filter split transactions.
         is_recurring: Filter recurring transactions.
     """
+    if type(limit) is not int or not 1 <= limit <= 500:
+        raise ValueError("limit must be an integer from 1 to 500")
     kwargs: dict[str, Any] = {"limit": limit}
     for k, v in {
         "start_date": start_date,
@@ -657,6 +668,15 @@ async def set_budget_amount(
         category_id: Category ID (get from get_transaction_categories).
         start_date: First day of the target month (YYYY-MM-01).
     """
+    if not math.isfinite(amount) or amount < 0:
+        raise ValueError("Budget amount must be finite and nonnegative")
+    try:
+        parsed = date.fromisoformat(start_date)
+    except ValueError:
+        raise ValueError("Use a YYYY-MM-01 month-start date") from None
+    if parsed.isoformat() != start_date or parsed.day != 1:
+        raise ValueError("Use a YYYY-MM-01 month-start date")
+    category_id = require_id(category_id)
     data = await _call(
         mm.set_budget_amount,
         amount=amount,
@@ -776,6 +796,8 @@ app = Starlette(
     ],
     lifespan=lifespan,
 )
+
+app.add_middleware(OAuthAdmissionGuard, storage_root=fastmcp_settings.home / "oauth-proxy")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")

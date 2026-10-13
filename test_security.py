@@ -250,7 +250,7 @@ class RouteTests(unittest.TestCase):
             calls.append(1)
             raise TransportServerError("expired", code=401)
 
-        with self.assertRaises(TransportServerError):
+        with self.assertRaisesRegex(ValueError, "Monarch request failed"):
             asyncio.run(server._call(expired))
         self.assertEqual(len(calls), 1)
         self.assertIn("Cookie", server.mm._headers)

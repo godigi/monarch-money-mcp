@@ -2,14 +2,18 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Patch base-image decoder/installer before installing application packages.
+RUN apt-get update && apt-get install -y --no-install-recommends --only-upgrade liblzma5 && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.lock .
-RUN pip install --no-cache-dir -r requirements.lock \
+RUN python -m pip install --no-cache-dir --upgrade pip==26.2.1 && pip install --no-cache-dir -r requirements.lock \
     && groupadd --gid 10001 monarch \
     && useradd --uid 10001 --gid 10001 --create-home monarch \
     && mkdir /data \
-    && chown 10001:10001 /data
+    && chown 10001:10001 /data \
+    && python -m pip uninstall -y pip
 
-COPY server.py transaction_tools.py rule_management.py attachments.py .
+COPY server.py transaction_tools.py rule_management.py attachments.py security.py .
 
 EXPOSE 8000
 USER 10001:10001

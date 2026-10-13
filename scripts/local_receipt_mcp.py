@@ -12,8 +12,13 @@ import base64
 import logging
 import os
 import tempfile
+import sys
 from pathlib import Path
 from urllib.parse import urlsplit
+
+# The helper runs by absolute path from the persistent repository checkout.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from security import install_private_logging
 
 from cryptography.fernet import Fernet
 from fastmcp import Client, FastMCP
@@ -106,6 +111,7 @@ class RemoteReceiptBridge:
 
 
 def build_server(bridge):
+    install_private_logging()
     mcp = FastMCP("Monarch local receipts")
     mcp.tool(bridge.upload_transaction_receipt, annotations={
         "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False})
