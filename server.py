@@ -25,6 +25,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
+from attachments import register_attachment_tools
+from transaction_tools import register_transaction_tools
+
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("monarch_mcp")
 logger.setLevel(logging.INFO)
@@ -367,10 +370,18 @@ mcp = FastMCP(
         "Tools for querying Monarch Money personal finance data: accounts, balances, "
         "transactions, cashflow, budgets, net worth, recurring subscriptions, and "
         "investment holdings. Use ISO 8601 dates (YYYY-MM-DD) for all date parameters. "
-        "Default date range when unspecified: current calendar month."
+        "Default date range when unspecified: current calendar month. "
+        "List category/tag IDs and identify the exact transaction before writes. "
+        "Show rule previews to the user before creating a native rule; applying to "
+        "existing history is off by default. Receipts attach to an existing transaction "
+        "without OCR or changing amounts. Use the local Monarch receipts helper for "
+        "Claude Code file paths; the remote server cannot read Mac paths."
     ),
     auth=_AUTH,
 )
+
+transaction_tools = register_transaction_tools(mcp, mm, _call)
+receipt_tools = register_attachment_tools(mcp, transaction_tools)
 
 # --- MCP Tools ---------------------------------------------------------------
 

@@ -9,7 +9,7 @@ RUN pip install --no-cache-dir -r requirements.lock \
     && mkdir /data \
     && chown 10001:10001 /data
 
-COPY server.py .
+COPY server.py transaction_tools.py attachments.py .
 
 EXPOSE 8000
 USER 10001:10001
