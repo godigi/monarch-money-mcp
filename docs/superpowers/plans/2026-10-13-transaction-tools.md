@@ -50,7 +50,7 @@ Interfaces: local upload_transaction_receipt(transaction_id, file_path) reads a 
 - [x] Test local path/size checks and byte-transfer contract without a real financial write.
 - [x] Implement helper and install/configure it for local Claude Code.
 - [x] Review complete diff, run full suites, and build/verify container boundary.
-- [ ] Commit/push through the workspace's commit mechanism, deploy existing Coolify app, verify running tools and read queries, update docs/history and clean merged branches.
+- [x] Commit/push through the workspace's commit mechanism, deploy existing Coolify app, verify running tools and read queries. Infra documentation and worktree cleanup are recorded in CHANGELOG item 345.
 
 ## Execution rulings and ledger
 
@@ -63,3 +63,5 @@ Review ruling: normalize file URLs with yarl before validating hostnames; otherw
 Final pre-deployment evidence: full discovery 48/48 and allowlist 7/7. Fresh reviewer confirmed three resolved findings (Unicode IP normalization, atomic OAuth cache key publication, concurrent same-name tag creation). Rebuilt image on VPS with synthetic secrets and no networking: UID 10001, health 200, anonymous MCP 401, 20 runtime tools, fileParams metadata and required download_url/file_id verified. No financial write performed.
 
 Local client setup: monarch-money (remote HTTP) and monarch-receipts (local stdio) added to the operator's user-level Claude Code config. Actual local tool discovery finds upload_transaction_receipt. First OAuth sign-in revealed FileTreeStore treating server-URL keys as nested paths; a real TokenStorageAdapter regression reproduced it. Explicit AlwaysHashStrategy fixes keys; 49 tests pass. OAuth sign-in then completed using the encrypted cache, without uploading a file. Production core deploy hqpp75gs4ma4l9u7kl9kqha2 is in progress from source cc7e657.
+
+Deployment verified: Coolify hqpp75gs4ma4l9u7kl9kqha2 finished with core cc7e657; container healthy, runtime hashes match, external boundary 8/8. Authenticated remote client discovers 20 tools, reads 9 tags/28 rules, and previews 113 transactions with zero matches without a native write. Both BetterStack monitors up. ChatGPT app refreshed and its dialog visibly lists the new actions (Write7/Read13). Local helper fix CI passed; restart/reconnect Claude Code to load its new user MCP entries. Actual native financial writes remain unverified until specifically authorized; the deployed extension is available for normal approved use.
