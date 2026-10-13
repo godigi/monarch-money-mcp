@@ -62,6 +62,16 @@ class LocalReceiptTests(unittest.IsolatedAsyncioTestCase):
             for file in path.rglob("*"):
                 if file.is_file(): self.assertNotIn(b"synthetic-private-token", file.read_bytes())
 
+    async def test_oauth_url_keys_can_be_persisted_by_real_token_adapter(self):
+        from fastmcp.client.auth.oauth import TokenStorageAdapter
+        from mcp.shared.auth import OAuthClientInformationFull
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = TokenStorageAdapter(encrypted_store(Path(directory) / "state"),
+                                          "https://monarch-mcp.briansagency.com/mcp")
+            info = OAuthClientInformationFull(client_id="synthetic-client", redirect_uris=["http://localhost:12345/callback"])
+            await adapter.set_client_info(info)
+            self.assertEqual((await adapter.get_client_info()).client_id, "synthetic-client")
+
     async def test_concurrent_first_launch_never_observes_partial_key(self):
         import threading
         from concurrent.futures import ThreadPoolExecutor

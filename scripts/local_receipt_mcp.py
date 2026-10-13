@@ -20,6 +20,7 @@ from fastmcp import Client, FastMCP
 from fastmcp.client.auth import OAuth
 from key_value.aio.stores.filetree import FileTreeStore
 from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+from key_value.aio._utils.sanitization import AlwaysHashStrategy
 
 ENDPOINT = "https://monarch-mcp.briansagency.com/mcp"
 MAX_BYTES = 10 * 1024 * 1024
@@ -44,7 +45,8 @@ def encrypted_store(directory: Path):
             finally:
                 temporary.unlink(missing_ok=True)
     key_path.chmod(0o600)
-    return FernetEncryptionWrapper(FileTreeStore(data_directory=directory / "tokens"),
+    return FernetEncryptionWrapper(FileTreeStore(data_directory=directory / "tokens",
+                                                key_sanitization_strategy=AlwaysHashStrategy()),
                                    fernet=Fernet(key_path.read_bytes()))
 
 
