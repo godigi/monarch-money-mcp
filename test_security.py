@@ -1,4 +1,4 @@
-"""Security boundary checks for the vps2 Monarch deployment."""
+"""Security boundary checks for the Monarch deployment (prod1)."""
 
 import asyncio
 import os

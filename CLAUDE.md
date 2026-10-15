@@ -1,6 +1,6 @@
 # Monarch Money MCP fork
 
-This is the hardened, single-tenant fork for vps2. Read README.md before changing the server.
+This is the hardened, single-tenant fork, hosted on prod1 (Coolify app `r7baehvexg3gfuo7voy395o6`; moved from vps2 on 2026-10-15). Read README.md before changing the server.
 
 - The only data route is OAuth-protected `/mcp`; `/health` returns no account data.
 - No REST routes, static API key, password login, or token-return route may be restored without an explicit security review.
