@@ -9,6 +9,8 @@ permissions:
 
 jobs:
   tests:
+    # stuck-job guard, 2026-10-25
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
